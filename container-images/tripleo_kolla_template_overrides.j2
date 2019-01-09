@@ -37,14 +37,33 @@ gpgcheck=0' >> /etc/yum.repos.d/opendaylight.repo
 # This installs the novajoin package in the nova container images; This is
 # required for TLS everywhere, as nova-api will use the cloud-init script
 # provided by the novajoin package in order to enroll the nodes to the CA
+{% if base_distro_tag in ['28', '8'] %}
+{% set nova_api_packages_append = ['python3-novajoin'] %}
+{% set nova_compute_ironic_packages_append = ['python3-novajoin'] %}
+{% else %}
 {% set nova_api_packages_append = ['python-novajoin'] %}
 {% set nova_compute_ironic_packages_append = ['python-novajoin'] %}
+{% endif %}
 
 {% set nova_scheduler_packages_append = ['openstack-tripleo-common'] %}
 
 # Required for mistral-db-populate to load tripleo custom actions on
 # the undercloud
-{% set mistral_base_packages_append = ['openstack-tripleo-common', 'ansible', 'python-shade', 'skydive-ansible'] %}
+{% set mistral_base_packages_append = ['openstack-tripleo-common'] %}
+{% if base_distro_tag in ['28', '8'] %}
+{% set mistral_base_packages_append = mistral_base_packages_append + [
+  'python3-shade',
+  'ansible-python3',
+] %}
+# TODO(aschultz): currently missing
+#  'skydive-ansible',
+{% else %}
+{% set mistral_base_packages_append = mistral_base_packages_append + [
+  'python-shade',
+  'ansible',
+  'skydive-ansible',
+] %}
+{% endif %}
 
 # NOTE: Mistral executor needs:
 #   openstack-tripleo-validations: validations
@@ -54,7 +73,23 @@ gpgcheck=0' >> /etc/yum.repos.d/opendaylight.repo
 #           deploy.
 #   tripleo-heat-templates: to load the default plan from the CLI/UI
 #   python-notario: ceph-ansible depends on this but it is bind mounted from host
-{% set mistral_executor_packages_append = ['openstack-tripleo-validations', 'openstack-nova-common', 'docker', 'podman', 'libseccomp', 'openstack-tripleo-heat-templates', 'python2-notario'] %}
+{% set mistral_executor_packages_append = [
+  'openstack-tripleo-validations',
+  'openstack-nova-common',
+  'docker',
+  'podman',
+  'libseccomp',
+  'openstack-tripleo-heat-templates',
+] %}
+{% if base_distro_tag in ['28', '8'] %}
+{% set mistral_executor_packages_append = mistral_executor_packages_append + [
+    'python3-notario'
+] %}
+{% else %}
+{% set mistral_executor_packages_append = mistral_executor_packages_append + [
+  'python2-notario'
+] %}
+{% endif %}
 
 # FIXME (kolla review to add ceilometer to swift proxy image)
 # NOTE (jaosorior): swift proxy with TLS everywhere needs these packages.
@@ -76,10 +111,22 @@ RUN sed -i -r 's,^(Listen 80),#\1,' /etc/httpd/conf/httpd.conf \
 # NOTE (jaosorior): neutron-server with TLS everywhere needs httpd and mod_ssl packages.
 # NOTE (hjensas): python2-networking-baremetal ML2 plug-in for ironic neutron integration.
 # NOTE (ramishra): python2-networking-ansible ML2 plug-in for neutron ansible integration.
-{% set neutron_server_packages_append = ['httpd',
-                                         'mod_ssl',
-                                         'python2-networking-baremetal',
-                                         'python2-networking-ansible'] %}
+{% set neutron_server_packages_append = [
+  'httpd',
+  'mod_ssl',
+] %}
+{% if base_distro_tag in ['28', '8'] %}
+{% set neutron_server_packages_append = neutron_server_packages_append + [
+  'python3-networking-baremetal',
+  'python3-networking-ansible'
+] %}
+{% else %}
+{% set neutron_server_packages_append = neutron_server_packages_append + [
+  'python2-networking-baremetal',
+  'python2-networking-ansible'
+] %}
+{% endif %}
+
 {% block neutron_server_footer %}
 RUN sed -i -r 's,^(Listen 80),#\1,' /etc/httpd/conf/httpd.conf \
     && sed -i -r 's,^(Listen 443),#\1,' /etc/httpd/conf.d/ssl.conf \
@@ -100,8 +147,23 @@ RUN sed -i -r 's,^(Listen 80),#\1,' /etc/httpd/conf/httpd.conf \
 
 # NOTE (jaosorior): redis with TLS everywhere needs these packages.
 # redis resource-agent requires pidof
-{% set redis_packages_append = ['stunnel', 'sysvinit-tools',
-    'pacemaker', 'pacemaker-remote', 'pcs', 'libqb', 'resource-agents'] %}
+{% set redis_packages_append = [
+  'stunnel',
+  'pacemaker',
+  'pacemaker-remote',
+  'pcs',
+  'libqb',
+  'resource-agents'
+] %}
+{% if base_distro_tag in ['28', '8'] %}
+{% set redis_packages_append = [
+  'procps-ng',
+] %}
+{% else %}
+{% set redis_packages_append = redis_packages_append + [
+  'sysvinit-tools',
+] %}
+{% endif %}
 
 # Remove packages not present in repos
 #
