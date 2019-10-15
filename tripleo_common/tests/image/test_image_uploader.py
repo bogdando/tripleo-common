@@ -1309,7 +1309,7 @@ class TestPythonImageUploader(base.TestCase):
                 'sha256:ccc': target_url,
             },
             ['sha256:aaa', 'sha256:bbb', 'sha256:ccc'],
-            session=target_session)
+            session=target_session, lock=None)
 
         _copy_registry_to_registry.assert_called_once_with(
             source_url,
@@ -1544,7 +1544,7 @@ class TestPythonImageUploader(base.TestCase):
                 'sha256:ccc': target_url,
             },
             ['sha256:aaa', 'sha256:bbb', 'sha256:ccc'],
-            session=target_session)
+            session=target_session, lock=None)
 
         _copy_registry_to_registry.assert_called_once_with(
             source_url,
@@ -1664,7 +1664,7 @@ class TestPythonImageUploader(base.TestCase):
                     'sha256:ccc': target_url,
                 },
                 ['sha256:aaa', 'sha256:bbb', 'sha256:ccc'],
-                session=target_session
+                session=target_session, lock=None
             ),
             mock.call(
                 target_url,
@@ -1674,7 +1674,7 @@ class TestPythonImageUploader(base.TestCase):
                     'sha256:ccc': target_url,
                 },
                 ['sha256:aaa', 'sha256:bbb', 'sha256:ccc'],
-                session=target_session
+                session=target_session, lock=None
             )
         ])
 
@@ -1702,7 +1702,8 @@ class TestPythonImageUploader(base.TestCase):
         _copy_local_to_registry.assert_called_once_with(
             local_modified_url,
             target_url,
-            session=target_session
+            session=target_session,
+            lock=None
         )
 
     @mock.patch('tripleo_common.image.image_uploader.'
@@ -1754,7 +1755,7 @@ class TestPythonImageUploader(base.TestCase):
         ])
         mock_detect.assert_called_once_with(target_url, target_session)
         mock_copy.assert_called_once_with(source_url, target_url,
-                                          session=target_session)
+                                          session=target_session, lock=None)
 
     @mock.patch('tripleo_common.image.image_uploader.'
                 'BaseImageUploader.check_status')
@@ -1816,7 +1817,8 @@ class TestPythonImageUploader(base.TestCase):
 
     @mock.patch('tripleo_common.image.image_uploader.'
                 'PythonImageUploader._upload_url')
-    def test_copy_layer_registry_to_registry(self, _upload_url):
+    @mock.patch('tripleo_common.utils.image.uploaded_layers_details')
+    def test_copy_layer_registry_to_registry(self, global_check, _upload_url):
         _upload_url.return_value = 'https://192.168.2.1:5000/v2/upload'
         source_url = urlparse('docker://docker.io/t/nova-api:latest')
         target_url = urlparse('docker://192.168.2.1:5000/t/nova-api:latest')
@@ -1835,6 +1837,7 @@ class TestPythonImageUploader(base.TestCase):
         layer = layer_entry['digest']
 
         # layer already exists at destination
+        global_check.return_value = (None, None)
         self.requests.head(
             'https://192.168.2.1:5000/v2/t/nova-api/blobs/%s' % blob_digest,
             status_code=200
@@ -2022,8 +2025,9 @@ class TestPythonImageUploader(base.TestCase):
     @mock.patch('subprocess.Popen')
     @mock.patch('tripleo_common.image.image_uploader.'
                 'PythonImageUploader._upload_url')
-    def test_copy_layer_local_to_registry(self, _upload_url, mock_popen,
-                                          mock_exists):
+    @mock.patch('tripleo_common.utils.image.uploaded_layers_details')
+    def test_copy_layer_local_to_registry(self, global_check, _upload_url,
+                                          mock_popen, mock_exists):
         mock_exists.return_value = True
         _upload_url.return_value = 'https://192.168.2.1:5000/v2/upload'
         target_url = urlparse('docker://192.168.2.1:5000/t/nova-api:latest')
@@ -2048,6 +2052,7 @@ class TestPythonImageUploader(base.TestCase):
         }
 
         # layer already exists at destination
+        global_check.return_value = (None, None)
         self.requests.head(
             'https://192.168.2.1:5000/v2/t/'
             'nova-api/blobs/%s' % compressed_digest,
@@ -2091,7 +2096,7 @@ class TestPythonImageUploader(base.TestCase):
             status_code=200
         )
         self.assertEqual(
-            compressed_digest,
+            (compressed_digest, 'docker://192.168.2.1:5000/t/nova-api:latest'),
             self.uploader._copy_layer_local_to_registry(
                 target_url,
                 session=target_session,
@@ -2117,6 +2122,7 @@ class TestPythonImageUploader(base.TestCase):
             layer
         )
 
+    @mock.patch('tripleo_common.utils.image.uploaded_layers_details')
     @mock.patch('tripleo_common.image.image_uploader.'
                 'PythonImageUploader._image_manifest_config')
     @mock.patch('tripleo_common.image.image_uploader.'
@@ -2127,11 +2133,12 @@ class TestPythonImageUploader(base.TestCase):
                 'PythonImageUploader._upload_url')
     def test_copy_local_to_registry(self, _upload_url, _containers_json,
                                     _copy_layer_local_to_registry,
-                                    _image_manifest_config):
+                                    _image_manifest_config, _global_check):
         source_url = urlparse('containers-storage:/t/nova-api:latest')
         target_url = urlparse('docker://192.168.2.1:5000/t/nova-api:latest')
         target_session = requests.Session()
         _upload_url.return_value = 'https://192.168.2.1:5000/v2/upload'
+        _global_check.return_value = (None, None)
         layers = [{
             "compressed-diff-digest": "sha256:aeb786",
             "compressed-size": 74703002,
@@ -2185,7 +2192,8 @@ class TestPythonImageUploader(base.TestCase):
         self.uploader._copy_local_to_registry(
             source_url=source_url,
             target_url=target_url,
-            session=target_session
+            session=target_session,
+            lock=None
         )
 
         _containers_json.assert_called_once_with(

@@ -27,3 +27,4 @@ class ProcessLock(base.BaseLock):
     def __init__(self):
         self._lock = self._mgr.Lock()
         self._objects = self._mgr.list()
+        self._global_view = self._mgr.dict()

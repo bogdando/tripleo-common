@@ -40,6 +40,7 @@ from tripleo_common.image.exception import ImageNotFoundException
 from tripleo_common.image.exception import ImageUploaderException
 from tripleo_common.image.exception import ImageUploaderThreadException
 from tripleo_common.image import image_export
+from tripleo_common.utils import image as image_utils
 from tripleo_common.utils.locks import threadinglock
 
 
@@ -281,6 +282,7 @@ class BaseImageUploader(object):
     secure_registries = set(SECURE_REGISTRIES)
     export_registries = set()
     push_registries = set()
+    uploaded_layers = {}
 
     def __init__(self, lock=None):
         self.upload_tasks = []
@@ -300,6 +302,7 @@ class BaseImageUploader(object):
         cls.mirrors.clear()
         cls.export_registries.clear()
         cls.push_registries.clear()
+        cls.uploaded_layers.clear()
 
     def cleanup(self):
         pass
@@ -907,13 +910,15 @@ class BaseImageUploader(object):
         stop=tenacity.stop_after_attempt(5)
     )
     def _cross_repo_mount(cls, target_image_url, image_layers,
-                          source_layers, session):
+                          source_layers, session, lock=None):
+        view_snapshot = cls._global_view_proxy(lock=lock)
         netloc = target_image_url.netloc
         name = target_image_url.path.split(':')[0][1:]
         export = netloc in cls.export_registries
         if export:
             image_export.cross_repo_mount(
-                target_image_url, image_layers, source_layers)
+                target_image_url, image_layers, source_layers,
+                uploaded_layers=view_snapshot)
             return
 
         if netloc in cls.insecure_registries:
@@ -923,8 +928,18 @@ class BaseImageUploader(object):
         url = '%s://%s/v2/%s/blobs/uploads/' % (scheme, netloc, name)
 
         for layer in source_layers:
-            if layer in image_layers:
-                existing_name = image_layers[layer].path.split(':')[0][1:]
+            view_snapshot = cls._global_view_proxy(lock=lock)
+            known_path, existing_name = image_utils.uploaded_layers_details(
+                view_snapshot, layer)
+            if layer in image_layers or existing_name and known_path:
+                if existing_name and parse.urlparse(known_path).scheme:
+                    if existing_name != name:
+                        LOG.debug('[%s] Layer recognized as already uploaded '
+                                  'for remote image %s to %s'
+                                  % (name, existing_name, known_path))
+                else:
+                    existing_name = image_layers[layer].path.split(':')[0][1:]
+
                 LOG.info('[%s] Cross repository blob mount from %s' %
                          (layer, existing_name))
                 data = {
@@ -938,6 +953,10 @@ class BaseImageUploader(object):
 
 class SkopeoImageUploader(BaseImageUploader):
     """Upload images using skopeo copy"""
+
+    @classmethod
+    def _global_view_proxy(cls, value=None, lock=None, forget=False):
+        pass
 
     def upload_image(self, task):
         t = task
@@ -989,7 +1008,7 @@ class SkopeoImageUploader(BaseImageUploader):
             source_layers = source_inspect.get('Layers', [])
             self._cross_repo_mount(
                 t.target_image_url, self.image_layers, source_layers,
-                session=target_session)
+                session=target_session, lock=t.lock)
         except Exception:
             LOG.error('[%s] Failed uploading the target '
                       'image' % t.target_image)
@@ -1136,15 +1155,19 @@ class PythonImageUploader(BaseImageUploader):
         if layer in lock.objects():
             LOG.debug('[%s] Layer is being fetched by another thread' % layer)
             raise ImageUploaderThreadException('layer being fetched')
+        known_path, image = image_utils.uploaded_layers_details(
+            cls._global_view_proxy(lock=lock), layer)
+        if image and known_path:
+            LOG.debug('[%s] Layer recognized as already '
+                      'uploaded for image %s to %s'
+                      % (layer, image, known_path))
+            return
         LOG.debug('Locking layer %s' % layer)
-        LOG.debug('Starting acquire for lock %s' % layer)
         with lock.get_lock():
             if layer in lock.objects():
                 LOG.debug('Collision for lock %s' % layer)
                 raise ImageUploaderThreadException('layer conflict')
-            LOG.debug('Acquired for lock %s' % layer)
             lock.objects().append(layer)
-            LOG.debug('Updated lock info %s' % layer)
         LOG.debug('Got lock on layer %s' % layer)
 
     @classmethod
@@ -1153,13 +1176,52 @@ class PythonImageUploader(BaseImageUploader):
             LOG.warning('No lock information provided for layer %s' % layer)
             return
         LOG.debug('Unlocking layer %s' % layer)
-        LOG.debug('Starting acquire for lock %s' % layer)
         with lock.get_lock():
-            LOG.debug('Acquired for unlock %s' % layer)
             while layer in lock.objects():
                 lock.objects().remove(layer)
-            LOG.debug('Updated lock info %s' % layer)
         LOG.debug('Released lock on layer %s' % layer)
+
+    @classmethod
+    def _global_view_proxy(cls, value=None, lock=None, forget=False):
+        if not lock:
+            LOG.warning('No lock information provided for value %s' % value)
+            return
+        with lock.get_lock():
+            if hasattr(lock, '_global_view'):
+                # covers shared state for multi-process workers
+                target_entity = lock._global_view
+            else:
+                # covers shared state for multi-threading workers
+                target_entity = cls.uploaded_layers
+
+            if value and forget:
+                target_entity.pop(value, None)
+            elif value:
+                target_entity.update(value)
+            else:
+                return target_entity
+
+            if hasattr(lock, '_global_view'):
+                # covers shared state for multi-process workers
+                lock._global_view = target_entity
+            else:
+                # covers shared state for multi-threading workers
+                cls.uploaded_layers = target_entity
+
+    @classmethod
+    def _track_uploaded_layers(cls, layer, known_path=None, image_ref=None,
+                               lock=None, forget=False):
+        if not lock:
+            LOG.warning('No lock information provided for layer %s' % layer)
+            return
+        if forget:
+            LOG.debug('Untracking uploaded layer %s' % layer)
+            cls._global_view_proxy(value=layer, lock=lock, forget=True)
+        else:
+            LOG.debug('Tracking uploaded layer %s' % layer)
+            cls._global_view_proxy(
+                value={layer: {'ref': image_ref, 'path': known_path}},
+                lock=lock)
 
     def upload_image(self, task):
         """Upload image from a task
@@ -1219,7 +1281,8 @@ class PythonImageUploader(BaseImageUploader):
                 self._copy_local_to_registry(
                     source_local_url,
                     t.target_image_url,
-                    session=target_session
+                    session=target_session,
+                    lock=lock
                 )
             except Exception:
                 LOG.warning('[%s] Failed copying the target image '
@@ -1266,7 +1329,7 @@ class PythonImageUploader(BaseImageUploader):
 
             self._cross_repo_mount(
                 copy_target_url, self.image_layers, source_layers,
-                session=target_session)
+                session=target_session, lock=lock)
             to_cleanup = []
 
             # Copy unmodified images from source to target
@@ -1313,13 +1376,14 @@ class PythonImageUploader(BaseImageUploader):
                 # cross-repo mount the unmodified image to the modified image
                 self._cross_repo_mount(
                     t.target_image_url, self.image_layers, source_layers,
-                    session=target_session)
+                    session=target_session, lock=t.lock)
 
                 # Copy from local storage to target registry
                 self._copy_local_to_registry(
                     target_image_local_url,
                     t.target_image_url,
-                    session=target_session
+                    session=target_session,
+                    lock=lock
                 )
                 LOG.info('[%s] Completed modify and upload for image' %
                          t.image_name)
@@ -1500,7 +1564,8 @@ class PythonImageUploader(BaseImageUploader):
         try:
             cls._layer_fetch_lock(layer, lock)
             if cls._target_layer_exists_registry(
-                    target_url, layer_entry, [layer_entry], target_session):
+                    target_url, layer_entry, [layer_entry], target_session,
+                    lock=lock):
                 cls._layer_fetch_unlock(layer, lock)
                 return
         except ImageUploaderThreadException:
@@ -1508,21 +1573,31 @@ class PythonImageUploader(BaseImageUploader):
             raise
         except Exception:
             cls._layer_fetch_unlock(layer, lock)
+            LOG.error('[%s] Failed checking layer existance for the target '
+                      'URL %s' % (layer, target_url.geturl()))
             raise
 
         digest = layer_entry['digest']
         LOG.debug('[%s] Uploading layer' % digest)
 
         calc_digest = hashlib.sha256()
+        layer_val = None
+        known_path = None
         try:
             layer_stream = cls._layer_stream_registry(
                 digest, source_url, calc_digest, source_session)
-            layer_val = cls._copy_stream_to_registry(
+            layer_val, known_path = cls._copy_stream_to_registry(
                 target_url, layer_entry, calc_digest, layer_stream,
                 target_session)
         except Exception:
+            cls._track_uploaded_layers(layer, lock=lock, forget=True)
+            LOG.error('[%s] Failed processing layer for the target '
+                      'image' % layer)
             raise
         else:
+            image_ref, _ = cls._image_tag_from_url(target_url)
+            cls._track_uploaded_layers(layer_val, known_path=known_path,
+                                       image_ref=image_ref, lock=lock)
             return layer_val
         finally:
             cls._layer_fetch_unlock(layer, lock)
@@ -1565,6 +1640,16 @@ class PythonImageUploader(BaseImageUploader):
         with futures.ThreadPoolExecutor(max_workers=4) as p:
             if source_layers:
                 for layer in source_layers:
+                    target_image, _ = cls._image_tag_from_url(target_url)
+                    known_path, ref_image = \
+                        image_utils.uploaded_layers_details(
+                            cls._global_view_proxy(lock=lock), layer)
+                    if ref_image == target_image:
+                        LOG.debug('[%s] Layer %s recognized as already '
+                                  'uploaded to %s'
+                                  % (image, layer, known_path))
+                        continue
+
                     copy_jobs.append(p.submit(
                         cls._copy_layer_registry_to_registry,
                         source_url, target_url,
@@ -1739,30 +1824,55 @@ class PythonImageUploader(BaseImageUploader):
         return out
 
     @classmethod
-    def _target_layer_exists_registry(cls, target_url, layer, check_layers,
-                                      session):
-        image, tag = cls._image_tag_from_url(target_url)
+    def _target_layer_exists_registry(cls, target_url, layer,
+                                      check_layers, session, lock=None):
+        # Check, if the layer had been already uploaded by the target registry
+        # URL for the given image and is tracked in the global view
+        view_snapshot = cls._global_view_proxy(lock=lock)
+        image, _ = cls._image_tag_from_url(target_url)
+        known_path, ref_image = image_utils.uploaded_layers_details(
+            view_snapshot, layer.get('digest', None))
+        if ref_image and ref_image == image:
+            LOG.debug('[%s] Layer recognized as already uploaded: '
+                      '%s to %s' % (image, layer['digest'], known_path))
+            return True
+
+        tag = None
+        if not image or not known_path:
+            image, tag = cls._image_tag_from_url(target_url)
+
         parts = {
             'image': image,
             'tag': tag
         }
-        # Do a HEAD call for the supplied digests
-        # to see if the layer is already in the registry
+        found = False
+        # Check the cached metadata or do a HEAD call for the supplied
+        # digests to see if the layer is already in the registry
         for l in check_layers:
             if not l:
                 continue
-            parts['digest'] = l['digest']
-            blob_url = cls._build_url(
-                target_url, CALL_BLOB % parts)
-            if session.head(blob_url, timeout=30).status_code == 200:
-                LOG.debug('[%s] Layer already exists: %s' %
-                          (image, l['digest']))
-                layer['digest'] = l['digest']
-                if 'size' in l:
-                    layer['size'] = l['size']
-                if 'mediaType' in l:
-                    layer['mediaType'] = l['mediaType']
-                return True
+            view_snapshot = cls._global_view_proxy(lock=lock)
+            known_path, ref_image = image_utils.uploaded_layers_details(
+                view_snapshot, l['digest'])
+            if ref_image and ref_image == image:
+                LOG.debug('[%s] Layer %s already exists at %s'
+                          % (image, l['digest'], known_path))
+                found = True
+            else:
+                parts['digest'] = l['digest']
+                blob_url = cls._build_url(
+                    target_url, CALL_BLOB % parts)
+                if session.head(blob_url, timeout=30).status_code == 200:
+                    LOG.debug('[%s] Layer already exists: %s' %
+                              (image, l['digest']))
+                    found = True
+        if found:
+            layer['digest'] = l['digest']
+            if 'size' in l:
+                layer['size'] = l['size']
+            if 'mediaType' in l:
+                layer['mediaType'] = l['mediaType']
+            return True
         return False
 
     @classmethod
@@ -1887,7 +1997,7 @@ class PythonImageUploader(BaseImageUploader):
         cls.check_status(session=session, request=upload_resp)
         layer['digest'] = layer_digest
         layer['size'] = length
-        return layer_digest
+        return (layer_digest, parse.urlunparse(target_url))
 
     @classmethod
     @tenacity.retry(  # Retry up to 5 times with jittered exponential backoff
@@ -1898,7 +2008,8 @@ class PythonImageUploader(BaseImageUploader):
         wait=tenacity.wait_random_exponential(multiplier=1, max=10),
         stop=tenacity.stop_after_attempt(5)
     )
-    def _copy_local_to_registry(cls, source_url, target_url, session):
+    def _copy_local_to_registry(cls, source_url, target_url, session,
+                                lock=None):
         cls._assert_scheme(source_url, 'containers-storage')
         cls._assert_scheme(target_url, 'docker')
 
@@ -1918,6 +2029,16 @@ class PythonImageUploader(BaseImageUploader):
         jobs_finished = 0
         with futures.ThreadPoolExecutor(max_workers=4) as p:
             for layer in manifest['layers']:
+                target_image, _ = cls._image_tag_from_url(target_url)
+                known_path, ref_image = \
+                    image_utils.uploaded_layers_details(
+                        cls._global_view_proxy(lock=lock), layer['digest'])
+                if ref_image == target_image:
+                    LOG.debug('[%s] Layer recognized as already uploaded '
+                              'for %s image to %s'
+                              % (name, ref_image, known_path))
+                    continue
+
                 layer_entry = layers_by_digest[layer['digest']]
                 copy_jobs.append(p.submit(
                     cls._copy_layer_local_to_registry,
@@ -2088,10 +2209,6 @@ class PythonImageUploader(BaseImageUploader):
         if not self.upload_tasks:
             return
         local_images = []
-
-        # Pull a single image first, to avoid duplicate pulls of the
-        # same base layers
-        local_images.extend(upload_task(args=self.upload_tasks.pop()))
 
         with self._get_executor() as p:
             for result in p.map(upload_task, self.upload_tasks):
