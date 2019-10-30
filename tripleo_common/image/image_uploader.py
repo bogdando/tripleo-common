@@ -925,30 +925,65 @@ class BaseImageUploader(object):
             scheme = 'http'
         else:
             scheme = 'https'
-        url = '%s://%s/v2/%s/blobs/uploads/' % (scheme, netloc, name)
 
         for layer in source_layers:
             view_snapshot = cls._global_view_proxy(lock=lock)
-            known_path, existing_name = image_utils.uploaded_layers_details(
-                view_snapshot, layer)
+            known_path, existing_name, kind = \
+                image_utils.uploaded_layers_details(
+                    view_snapshot, layer)
             if layer in image_layers or existing_name and known_path:
-                if existing_name and parse.urlparse(known_path).scheme:
+                if existing_name and kind == 'remote':
                     if existing_name != name:
                         LOG.debug('[%s] Layer recognized as already uploaded '
                                   'for remote image %s to %s'
                                   % (name, existing_name, known_path))
+                        cls._track_uploaded_layers(
+                            layer, image_ref=existing_name,
+                            known_path=known_path, target=name, kind=kind,
+                            lock=lock)
                 else:
                     existing_name = image_layers[layer].path.split(':')[0][1:]
 
-                LOG.info('[%s] Cross repository blob mount from %s' %
-                         (layer, existing_name))
-                data = {
-                    'mount': layer,
-                    'from': existing_name
-                }
-                r = session.post(url, data=data, timeout=30)
-                cls.check_status(session=session, request=r)
-                LOG.debug('%s %s' % (r.status_code, r.reason))
+                # NOTE(bogdando): ensure all globally tracked remote targets
+                # that reference the source layers are patched via cross-repo
+                # blob mounting. Executed by multiple workers cooperatively,
+                # only once for each target image of each source layer, so the
+                # scope keeps updated (reduced) as it goes.
+                targets = image_utils.uploaded_layers_targets(
+                    view_snapshot, layer, kind='remote') + [existing_name]
+                while targets:
+                    # shuffle the taken snapshot of global view as
+                    # the best effort avoiding other workers on it
+                    if len(targets) > 3:
+                        random.shuffle(targets)
+                    for n in targets:
+                        n = targets.pop()
+                        if n != existing_name:
+                            url = ('%s://%s/v2/%s/blobs/uploads/' %
+                                   (scheme, netloc, n))
+                            LOG.info('[%s] Cross repository blob %s mount '
+                                     'from %s' % (n, layer, existing_name))
+                            data = {
+                                'mount': layer,
+                                'from': existing_name
+                            }
+                            if lock:
+                                with lock.get_lock():
+                                    r = session.post(url, data=data,
+                                                     timeout=30)
+                            else:
+                                r = session.post(url, data=data, timeout=30)
+                            cls.check_status(session=session, request=r)
+                            LOG.debug('%s %s' % (r.status_code, r.reason))
+
+                        # reduce remaining targets in global view for workers
+                        cls._track_uploaded_layers(layer, target=n, lock=lock,
+                                                   kind='remote', forget=True)
+
+                    # update the remaining targets for all workers
+                    view_snapshot = cls._global_view_proxy(lock=lock)
+                    targets = image_utils.uploaded_layers_targets(
+                        view_snapshot, layer, kind='remote')
 
 
 class SkopeoImageUploader(BaseImageUploader):
@@ -1155,12 +1190,12 @@ class PythonImageUploader(BaseImageUploader):
         if layer in lock.objects():
             LOG.debug('[%s] Layer is being fetched by another thread' % layer)
             raise ImageUploaderThreadException('layer being fetched')
-        known_path, image = image_utils.uploaded_layers_details(
+        known_path, image, kind = image_utils.uploaded_layers_details(
             cls._global_view_proxy(lock=lock), layer)
         if image and known_path:
             LOG.debug('[%s] Layer recognized as already '
-                      'uploaded for image %s to %s'
-                      % (layer, image, known_path))
+                      'uploaded for %s image %s to %s'
+                      % (layer, kind, image, known_path))
             return
         LOG.debug('Locking layer %s' % layer)
         with lock.get_lock():
@@ -1182,7 +1217,18 @@ class PythonImageUploader(BaseImageUploader):
         LOG.debug('Released lock on layer %s' % layer)
 
     @classmethod
-    def _global_view_proxy(cls, value=None, lock=None, forget=False):
+    def _global_view_proxy(cls, value=None, scope=None, lock=None,
+                           forget=False, overwrite_node=None,
+                           exactly_once=False):
+        """Return/operate an internal structure to track generic state
+
+        Based on the used MP/MT workers type, picks an apropriate entity to
+        return or operate on it. Supports removing or deep updating global view
+        graf nodes, with the optional overwriting of nodes data stored there
+        via setting overwrite_node. Other values in the nodes can also be
+        overwritten, unless exactly_once=True. The given value may be updated
+        or forgotten by some optional scope of the global view.
+        """
         if not lock:
             LOG.warning('No lock information provided for value %s' % value)
             return
@@ -1194,10 +1240,16 @@ class PythonImageUploader(BaseImageUploader):
                 # covers shared state for multi-threading workers
                 target_entity = cls.uploaded_layers
 
-            if value and forget:
+            if value and forget and scope and scope in target_entity:
+                target_entity[scope].pop(value, None)
+            elif value and forget:
                 target_entity.pop(value, None)
             elif value:
-                target_entity.update(value)
+                if scope and scope not in value:
+                    value = {scope: value}
+                image_utils.partial_merge(target_entity, value,
+                                          update_bottoms=False,
+                                          overwrite_node=overwrite_node)
             else:
                 return target_entity
 
@@ -1210,18 +1262,58 @@ class PythonImageUploader(BaseImageUploader):
 
     @classmethod
     def _track_uploaded_layers(cls, layer, known_path=None, image_ref=None,
-                               lock=None, forget=False):
+                               lock=None, target=None, kind='local',
+                               forget=False):
+        """Track the uploaded layer entry in the global view of all workers
+
+        Set up (only once per a layer) or forget the reference image and the
+        known path by which the given layer should be tracked. Allows tracking
+        that layer by the local or remote scopes, or both (requires a separate
+        invocation with another kind passed).
+
+        If 'target' is set, also update the list of target images referencing
+        the given tracked layer by its reference image/path, or forgetting a
+        single target w/o remothing the whole tracked layer entry.
+        """
+
         if not lock:
             LOG.warning('No lock information provided for layer %s' % layer)
             return
-        if forget:
-            LOG.debug('Untracking uploaded layer %s' % layer)
-            cls._global_view_proxy(value=layer, lock=lock, forget=True)
+        if forget and not target:
+            LOG.debug('Untracking uploaded %s layer %s' % (kind, layer))
+            cls._global_view_proxy(value=layer, scope=kind, lock=lock,
+                                   forget=True)
         else:
-            LOG.debug('Tracking uploaded layer %s' % layer)
-            cls._global_view_proxy(
-                value={layer: {'ref': image_ref, 'path': known_path}},
-                lock=lock)
+            LOG.debug('Tracking uploaded %s layer %s' % (kind, layer))
+            overwrite_node = None
+            items = {}
+            fastpath = True  # assume fastpath as no targets to merge
+            view_snapshot = cls._global_view_proxy(lock=lock)
+            if forget and target:
+                LOG.debug('[%s] Unreferencing %s target image for '
+                          'uploaded layer %s' % (target, kind, layer))
+                items = image_utils.uploaded_layers_targets(view_snapshot,
+                                                            layer)
+                items.pop(target, None)
+                overwrite_node = 'targets'
+                fastpath = False
+            elif target:
+                LOG.debug('[%s] Adding %s target image reference for '
+                          'uploaded layer %s' % (target, kind, layer))
+                items = {target: kind}
+                fastpath = False
+
+            # provides fastpath if no targets needs updating
+            if layer in view_snapshot.get(kind, {}) and fastpath:
+                return
+
+            # update it only once so the given image becomes a fixed reference
+            # if targets present, merge it or overwrite, if removing a one
+            value = {layer: {
+                'ref': image_ref, 'path': known_path, 'targets': items}}
+            cls._global_view_proxy(value=value, scope=kind, lock=lock,
+                                   overwrite_node=overwrite_node,
+                                   exactly_once=True)
 
     def upload_image(self, task):
         """Upload image from a task
@@ -1590,14 +1682,19 @@ class PythonImageUploader(BaseImageUploader):
                 target_url, layer_entry, calc_digest, layer_stream,
                 target_session)
         except Exception:
-            cls._track_uploaded_layers(layer, lock=lock, forget=True)
+            # by any scope
+            cls._track_uploaded_layers(layer, lock=lock, kind='remote',
+                                       forget=True)
+            cls._track_uploaded_layers(layer, lock=lock, kind='local',
+                                       forget=True)
             LOG.error('[%s] Failed processing layer for the target '
                       'image' % layer)
             raise
         else:
             image_ref, _ = cls._image_tag_from_url(target_url)
             cls._track_uploaded_layers(layer_val, known_path=known_path,
-                                       image_ref=image_ref, lock=lock)
+                                       image_ref=image_ref, kind='remote',
+                                       lock=lock)
             return layer_val
         finally:
             cls._layer_fetch_unlock(layer, lock)
@@ -1641,13 +1738,19 @@ class PythonImageUploader(BaseImageUploader):
             if source_layers:
                 for layer in source_layers:
                     target_image, _ = cls._image_tag_from_url(target_url)
-                    known_path, ref_image = \
+                    known_path, ref_image, kind = \
                         image_utils.uploaded_layers_details(
                             cls._global_view_proxy(lock=lock), layer)
+                    if ref_image != image:
+                        # Track this discovered cross-reference
+                        cls._track_uploaded_layers(
+                            layer, image_ref=ref_image,
+                            known_path=known_path, target=image, kind=kind,
+                            lock=lock)
                     if ref_image == target_image:
                         LOG.debug('[%s] Layer %s recognized as already '
-                                  'uploaded to %s'
-                                  % (image, layer, known_path))
+                                  'uploaded to %s %s'
+                                  % (image, layer, kind, known_path))
                         continue
 
                     copy_jobs.append(p.submit(
@@ -1665,6 +1768,7 @@ class PythonImageUploader(BaseImageUploader):
             for job in futures.as_completed(copy_jobs):
                 e = job.exception()
                 if e:
+                    cls._dump_global_view(lock)
                     raise e
                 layer = job.result()
                 if layer:
@@ -1827,14 +1931,16 @@ class PythonImageUploader(BaseImageUploader):
     def _target_layer_exists_registry(cls, target_url, layer,
                                       check_layers, session, lock=None):
         # Check, if the layer had been already uploaded by the target registry
-        # URL for the given image and is tracked in the global view
+        # URL for the given image and is tracked in the global view by any
+        # scope.
         view_snapshot = cls._global_view_proxy(lock=lock)
         image, _ = cls._image_tag_from_url(target_url)
-        known_path, ref_image = image_utils.uploaded_layers_details(
+        known_path, ref_image, kind = image_utils.uploaded_layers_details(
             view_snapshot, layer.get('digest', None))
         if ref_image and ref_image == image:
             LOG.debug('[%s] Layer recognized as already uploaded: '
-                      '%s to %s' % (image, layer['digest'], known_path))
+                      '%s to %s %s'
+                      % (image, layer['digest'], kind, known_path))
             return True
 
         tag = None
@@ -1852,11 +1958,11 @@ class PythonImageUploader(BaseImageUploader):
             if not l:
                 continue
             view_snapshot = cls._global_view_proxy(lock=lock)
-            known_path, ref_image = image_utils.uploaded_layers_details(
+            known_path, ref_image, kind = image_utils.uploaded_layers_details(
                 view_snapshot, l['digest'])
             if ref_image and ref_image == image:
-                LOG.debug('[%s] Layer %s already exists at %s'
-                          % (image, l['digest'], known_path))
+                LOG.debug('[%s] Layer %s already exists at %s %s'
+                          % (image, l['digest'], kind, known_path))
                 found = True
             else:
                 parts['digest'] = l['digest']
@@ -1963,9 +2069,19 @@ class PythonImageUploader(BaseImageUploader):
             layer_val, known_path = cls._copy_stream_to_registry(
                 target_url, layer, calc_digest, layer_stream, session,
                 verify_digest=False)
-        except Exception:
-            raise
+        except Exception as e:
+            cls._track_uploaded_layers(layer['digest'], lock=lock,
+                                       kind='local', forget=True)
+            cls._track_uploaded_layers(layer['digest'], lock=lock,
+                                       kind='remote', forget=True)
+            LOG.error('[%s] Failed processing layer for the target '
+                      'image' % layer['digest'])
+            raise e
         else:
+            image_ref, _ = image_export.image_tag_from_url(target_url)
+            cls._track_uploaded_layers(layer_val, known_path=known_path,
+                                       image_ref=image_ref, kind='local',
+                                       lock=lock)
             return layer_val
         finally:
             cls._layer_fetch_unlock(layer['digest'], lock)
@@ -2050,13 +2166,19 @@ class PythonImageUploader(BaseImageUploader):
         with futures.ThreadPoolExecutor(max_workers=4) as p:
             for layer in manifest['layers']:
                 target_image, _ = cls._image_tag_from_url(target_url)
-                known_path, ref_image = \
+                known_path, ref_image, kind = \
                     image_utils.uploaded_layers_details(
                         cls._global_view_proxy(lock=lock), layer['digest'])
+                if ref_image != name:
+                    # Track this discovered cross-reference in global view
+                    cls._track_uploaded_layers(
+                        layer['digest'], image_ref=ref_image,
+                        known_path=known_path, target=name, kind=kind,
+                        lock=lock)
                 if ref_image == target_image:
                     LOG.debug('[%s] Layer recognized as already uploaded '
-                              'for %s image to %s'
-                              % (name, ref_image, known_path))
+                              'for %s image %s to %s'
+                              % (name, kind, ref_image, known_path))
                     continue
 
                 layer_entry = layers_by_digest[layer['digest']]
@@ -2070,6 +2192,7 @@ class PythonImageUploader(BaseImageUploader):
             for job in futures.as_completed(copy_jobs):
                 e = job.exception()
                 if e:
+                    cls._dump_global_view(lock)
                     raise e
                 layer = job.result()
                 if layer:
@@ -2234,10 +2357,16 @@ class PythonImageUploader(BaseImageUploader):
             for result in p.map(upload_task, self.upload_tasks):
                 local_images.extend(result)
             LOG.info('result %s' % local_images)
+            self._dump_global_view(self.lock)
 
         # Do cleanup after all the uploads so common layers don't get deleted
         # repeatedly
         self.cleanup(local_images)
+
+    @classmethod
+    def _dump_global_view(cls, lock=None):
+        with open('tripleo-container-image-prepare-graph.yaml', 'w') as g:
+            yaml.safe_dump(cls._global_view_proxy(lock=lock), g)
 
 
 class UploadTask(object):
