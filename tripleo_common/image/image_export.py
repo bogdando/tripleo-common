@@ -17,11 +17,11 @@ import collections
 import hashlib
 import json
 import os
+import random
 import requests
 import shutil
 
 from oslo_log import log as logging
-from six.moves.urllib import parse
 from tripleo_common.utils import image as image_utils
 
 LOG = logging.getLogger(__name__)
@@ -154,18 +154,18 @@ def export_stream(target_url, layer, layer_stream, verify_digest=True):
 
 
 def cross_repo_mount(target_image_url, image_layers, source_layers,
-                     uploaded_layers=None):
+                     uploaded_layers=None, lock=None):
     target_image, _ = image_tag_from_url(target_image_url)
     for layer in source_layers:
-        known_path, image = image_utils.uploaded_layers_details(
+        known_path, image, kind = image_utils.uploaded_layers_details(
             uploaded_layers, layer)
 
-        if layer not in image_layers and not image:
+        if layer not in image_layers and not image or kind == 'remote':
             continue
 
-        if known_path and not parse.urlparse(known_path).scheme:
+        if known_path and image:
             LOG.debug('[%s] Layer recognized as already uploaded '
-                      'for image %s to %s' % (layer, image, known_path))
+                      'for local image %s to %s' % (layer, image, known_path))
             blob_path = known_path
         else:
             image_url = image_layers[layer]
@@ -176,17 +176,36 @@ def cross_repo_mount(target_image_url, image_layers, source_layers,
                 LOG.debug('[%s] Layer not found: %s' % (image, blob_path))
                 continue
 
-        target_image, _ = image_tag_from_url(target_image_url)
-        target_dir_path = os.path.join(
-            IMAGE_EXPORT_DIR, 'v2', target_image, 'blobs')
-        make_dir(target_dir_path)
-        target_blob_path = os.path.join(target_dir_path, '%s.gz' % layer)
-        if os.path.exists(target_blob_path):
-            continue
-        LOG.debug('[%s] Linking layers: %s -> %s' %
-                  (image, blob_path, target_blob_path))
-        # make a hard link so the layers can have independent lifecycles
-        os.link(blob_path, target_blob_path)
+        # NOTE(bogdando): ensure all globally tracked local targets
+        # that reference the source layers are cross-linked
+        # Executed by multiple workers cooperatively for each target image
+        # of each source layer. We can not reduce the global view here,
+        # but os.path.exists is not a costly check to repeat it as needed.
+        targets = image_utils.uploaded_layers_targets(
+            uploaded_layers, layer, kind='local')
+        if len(targets) > 2:
+            random.shuffle(targets)
+        for target in [target_image] + targets:
+            target_dir_path = os.path.join(
+                IMAGE_EXPORT_DIR, 'v2', target, 'blobs')
+            target_blob_path = os.path.join(target_dir_path, '%s.gz' % layer)
+            if blob_path == target_blob_path:
+                continue
+            # make a hard link so the layers can have independent lifecycles
+            # prevent collisions among multiple workers by using a lock
+            if lock:
+                with lock.get_lock():
+                    if os.path.exists(target_blob_path):
+                        continue
+                    make_dir(target_dir_path)
+                    os.link(blob_path, target_blob_path)
+            else:
+                if os.path.exists(target_blob_path):
+                    continue
+                make_dir(target_dir_path)
+                os.link(blob_path, target_blob_path)
+            LOG.debug('[%s] Linking layers for %s: %s -> %s' %
+                      (image, target, blob_path, target_blob_path))
 
 
 def export_manifest_config(target_url,

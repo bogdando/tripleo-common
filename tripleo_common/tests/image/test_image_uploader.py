@@ -1838,7 +1838,7 @@ class TestPythonImageUploader(base.TestCase):
 
         lock = mock.MagicMock()
         # layer already exists at destination
-        global_check.return_value = (None, None)
+        global_check.return_value = (None, None, None)
         self.requests.head(
             'https://192.168.2.1:5000/v2/t/nova-api/blobs/%s' % blob_digest,
             status_code=200
@@ -2055,7 +2055,7 @@ class TestPythonImageUploader(base.TestCase):
 
         lock = mock.MagicMock()
         # layer already exists at destination
-        global_check.return_value = (None, None)
+        global_check.return_value = (None, None, None)
         self.requests.head(
             'https://192.168.2.1:5000/v2/t/'
             'nova-api/blobs/%s' % compressed_digest,
@@ -2100,7 +2100,7 @@ class TestPythonImageUploader(base.TestCase):
             status_code=200
         )
         self.assertEqual(
-            (compressed_digest, 'docker://192.168.2.1:5000/t/nova-api:latest'),
+            compressed_digest,
             self.uploader._copy_layer_local_to_registry(
                 target_url,
                 session=target_session,
@@ -2143,7 +2143,7 @@ class TestPythonImageUploader(base.TestCase):
         target_url = urlparse('docker://192.168.2.1:5000/t/nova-api:latest')
         target_session = requests.Session()
         _upload_url.return_value = 'https://192.168.2.1:5000/v2/upload'
-        _global_check.return_value = (None, None)
+        _global_check.return_value = (None, None, None)
         layers = [{
             "compressed-diff-digest": "sha256:aeb786",
             "compressed-size": 74703002,

@@ -56,3 +56,6 @@ releasenotes/build
 
 # Playbook retry files
 *.retry
+
+# Other files
+tripleo-container-image-prepare-graph.yaml
