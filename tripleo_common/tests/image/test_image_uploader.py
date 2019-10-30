@@ -1836,6 +1836,7 @@ class TestPythonImageUploader(base.TestCase):
         }
         layer = layer_entry['digest']
 
+        lock = mock.MagicMock()
         # layer already exists at destination
         global_check.return_value = (None, None)
         self.requests.head(
@@ -1848,7 +1849,8 @@ class TestPythonImageUploader(base.TestCase):
                 target_url,
                 layer,
                 source_session=source_session,
-                target_session=target_session
+                target_session=target_session,
+                lock=lock
             )
         )
 
@@ -2051,6 +2053,7 @@ class TestPythonImageUploader(base.TestCase):
             'id': 'aaaa'
         }
 
+        lock = mock.MagicMock()
         # layer already exists at destination
         global_check.return_value = (None, None)
         self.requests.head(
@@ -2067,7 +2070,8 @@ class TestPythonImageUploader(base.TestCase):
                 target_url,
                 session=target_session,
                 layer=layer,
-                layer_entry=layer_entry
+                layer_entry=layer_entry,
+                lock=lock
             )
         )
 
@@ -2101,7 +2105,8 @@ class TestPythonImageUploader(base.TestCase):
                 target_url,
                 session=target_session,
                 layer=layer,
-                layer_entry=layer_entry
+                layer_entry=layer_entry,
+                lock=lock
             )
         )
         # test tar-split assemble call
@@ -2203,13 +2208,15 @@ class TestPythonImageUploader(base.TestCase):
             target_url,
             target_session,
             {'digest': 'sha256:aeb786'},
-            layers[0]
+            layers[0],
+            lock=None
         )
         _copy_layer_local_to_registry.assert_any_call(
             target_url,
             target_session,
             {'digest': 'sha256:4dc536'},
-            layers[1]
+            layers[1],
+            lock=None
         )
         self.assertTrue(put_config.called)
         self.assertTrue(put_manifest.called)

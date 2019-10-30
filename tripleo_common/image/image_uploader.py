@@ -1917,7 +1917,7 @@ class PythonImageUploader(BaseImageUploader):
         stop=tenacity.stop_after_attempt(5)
     )
     def _copy_layer_local_to_registry(cls, target_url,
-                                      session, layer, layer_entry):
+                                      session, layer, layer_entry, lock=None):
 
         # Do a HEAD call for the compressed-diff-digest and diff-digest
         # to see if the layer is already in the registry
@@ -1937,18 +1937,36 @@ class PythonImageUploader(BaseImageUploader):
                 'size': layer_entry.get('diff-size'),
                 'mediaType': MEDIA_BLOB,
             })
-        if cls._target_layer_exists_registry(target_url, layer, check_layers,
-                                             session):
-            return
+        try:
+            cls._layer_fetch_lock(layer['digest'], lock=lock)
+            if cls._target_layer_exists_registry(
+                    target_url, layer, check_layers, session):
+                cls._layer_fetch_unlock(layer['digest'], lock)
+                return
+        except ImageUploaderThreadException:
+            # skip trying to unlock, because that's what threw the exception
+            raise
+        except Exception:
+            cls._layer_fetch_unlock(layer['digest'], lock)
+            LOG.error('[%s] Failed checking layer existance for the target '
+                      'URL %s' % (layer['digest'], target_url.geturl()))
+            raise
 
         layer_id = layer_entry['id']
         LOG.debug('[%s] Uploading layer' % layer_id)
 
         calc_digest = hashlib.sha256()
-        layer_stream = cls._layer_stream_local(layer_id, calc_digest)
-        return cls._copy_stream_to_registry(target_url, layer, calc_digest,
-                                            layer_stream, session,
-                                            verify_digest=False)
+        try:
+            layer_stream = cls._layer_stream_local(layer_id, calc_digest)
+            layer_val = cls._copy_stream_to_registry(
+                target_url, layer, calc_digest, layer_stream, session,
+                verify_digest=False)
+        except Exception:
+            raise
+        else:
+            return layer_val
+        finally:
+            cls._layer_fetch_unlock(layer['digest'], lock)
 
     @classmethod
     def _copy_stream_to_registry(cls, target_url, layer, calc_digest,
@@ -2042,7 +2060,7 @@ class PythonImageUploader(BaseImageUploader):
                 layer_entry = layers_by_digest[layer['digest']]
                 copy_jobs.append(p.submit(
                     cls._copy_layer_local_to_registry,
-                    target_url, session, layer, layer_entry
+                    target_url, session, layer, layer_entry, lock=lock
                 ))
             jobs_count = len(copy_jobs)
             LOG.debug('[%s] Waiting for %i jobs to finish' %
