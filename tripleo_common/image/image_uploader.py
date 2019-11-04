@@ -1125,9 +1125,11 @@ class PythonImageUploader(BaseImageUploader):
     """Upload images using a direct implementation of the registry API"""
 
     @classmethod
-    @tenacity.retry(  # Retry until we no longer have collisions
+    @tenacity.retry(  # Limited retry until we no longer have collisions
+        reraise=True,
         retry=tenacity.retry_if_exception_type(ImageUploaderThreadException),
-        wait=tenacity.wait_random_exponential(multiplier=1, max=10)
+        wait=tenacity.wait_random_exponential(multiplier=1, max=10),
+        stop=tenacity.stop_after_attempt(6)
     )
     def _layer_fetch_lock(cls, layer, lock=None):
         if not lock:
