@@ -86,7 +86,10 @@ MEDIA_TYPES = (
     MEDIA_OCI_INDEX_V1,
     MEDIA_CONFIG,
     MEDIA_BLOB,
-    MEDIA_BLOB_COMPRESSED
+    MEDIA_BLOB_COMPRESSED,
+    MEDIA_TRIPLEO_DELTA_BLOB,
+    MEDIA_TRIPLEO_DELTA_MANIFEST,
+    MEDIA_TRIPLEO_DELTA_INDEX
 ) = (
     'application/vnd.docker.distribution.manifest.v1+json',
     'application/vnd.docker.distribution.manifest.v1+prettyjws',
@@ -96,7 +99,10 @@ MEDIA_TYPES = (
     'application/vnd.oci.image.index.v1+json',
     'application/vnd.docker.container.image.v1+json',
     'application/vnd.docker.image.rootfs.diff.tar',
-    'application/vnd.docker.image.rootfs.diff.tar.gzip'
+    'application/vnd.docker.image.rootfs.diff.tar.gzip',
+    'application/vnd.tripleo.delta.tar.diff',
+    'application/vnd.tripleo.delta.image.manifest.v1+json',
+    'application/vnd.tripleo.delta.image.index.v1+json'
 )
 
 DEFAULT_UPLOADER = 'python'
@@ -1665,6 +1671,7 @@ class PythonImageUploader(BaseImageUploader):
                 raise
         return cls._get_response_text(r)
 
+    # add _collect_manifest_layers_deltas? -> DeltaImage.DeltaLayers
     def _collect_manifests_layers(self, image_url, session,
                                   manifests_str, layers,
                                   multi_arch):
